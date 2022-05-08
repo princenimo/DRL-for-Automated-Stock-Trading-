@@ -6,8 +6,8 @@ import numpy as np
 import numpy.random as rd
 
 from copy import deepcopy
-from elegant_finrl.agent import ReplayBuffer, ReplayBufferMP
-
+#from elegant_finrl.agent import ReplayBuffer, ReplayBufferMP
+from elegant_drl_model.agent import ReplayBuffer, ReplayBufferMP
 gym.logger.set_level(40)  # Block warning: 'WARN: Box bound precision lowered by casting to float32'
 
 """Plan to
@@ -150,6 +150,7 @@ def mp_train(args, pipe1_eva, pipe1_exp_list):
     target_step = args.target_step
     repeat_times = args.repeat_times
     if_break_early = args.if_allow_break
+
     del args  # In order to show these hyper-parameters clearly, I put them above.
 
     '''init: environment'''
@@ -195,6 +196,8 @@ def mp_train(args, pipe1_eva, pipe1_exp_list):
     # act, steps, obj_a, obj_c = pipe2_eva.recv()  # recv
 
     '''start training'''
+
+
     if_solve = False
     while not ((if_break_early and if_solve)
                or total_step > break_step
@@ -216,6 +219,7 @@ def mp_train(args, pipe1_eva, pipe1_exp_list):
 
         '''update network parameters'''
         obj_a, obj_c = agent.update_net(buffer_mp, target_step, batch_size, repeat_times)
+        print('Done training boss uwu')
 
         '''saves the agent with max reward'''
         '''send'''
@@ -443,10 +447,19 @@ def get_episode_return(env, act, device) -> float:
     max_step = env.max_step
     if_discrete = env.if_discrete
 
+    if type(act).__name__ == 'ActorTRPO':
+      is_custom_TRPO = True
+
     state = env.reset()
     for _ in range(max_step):
-        s_tensor = torch.as_tensor((state,), device=device)
-        a_tensor = act(s_tensor)
+        s_tensor = torch.as_tensor(state, device=device)
+        #s_tensor = torch.as_tensor((state,), device=device)
+
+        if is_custom_TRPO:
+          action_mean, _, action_std = act(s_tensor.unsqueeze(0))
+          a_tensor = torch.normal(action_mean, action_std)
+        else:
+          a_tensor = act(s_tensor)
         if if_discrete:
             a_tensor = a_tensor.argmax(dim=1)
         action = a_tensor.cpu().numpy()[0]  # not need detach(), because with torch.no_grad() outside
