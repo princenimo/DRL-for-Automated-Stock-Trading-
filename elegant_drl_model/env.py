@@ -8,6 +8,7 @@ from stockstats import StockDataFrame as Sdf  # for Sdf.retype
 from pyfolio import timeseries
 import pyfolio
 from copy import deepcopy
+import torch
 
 class StockTradingEnv:
     def __init__(self, cwd='./envs/FinRL', gamma=0.99,
@@ -248,12 +249,20 @@ class StockTradingEnv:
         act = agent.act
         device = agent.device
 
+        if type(act).__name__ == 'ActorTRPO':
+          is_custom_TRPO = True        
+
         state = self.reset()
         episode_returns = [1.0]  # the cumulative_return / initial_account
         with _torch.no_grad():
             for i in range(self.max_step):
                 s_tensor = _torch.as_tensor((state,), device=device)
-                a_tensor = act(s_tensor)
+                
+                if is_custom_TRPO:
+                  action_mean, _, action_std = act(s_tensor)
+                  a_tensor = torch.normal(action_mean, action_std)
+                else:
+                  a_tensor = act(s_tensor)                
                 action = a_tensor.cpu().numpy()[0]  # not need detach(), because with torch.no_grad() outside
                 state, reward, done, _ = self.step(action)
 
