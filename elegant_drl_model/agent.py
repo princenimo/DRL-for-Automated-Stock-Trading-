@@ -9,6 +9,18 @@ from elegant_finrl.net import Actor, ActorSAC, ActorPPO
 from elegant_finrl.net import Critic, CriticAdv, CriticTwin
 from elegant_finrl.net import InterDPG, InterSPG, InterPPO
 
+#Import custom models 
+from elegant_drl_model.net import ActorTRPO, CriticTRPO
+
+from torch.autograd import Variable
+
+from elegant_drl_model.trpo import trpo_step
+from elegant_drl_model.utils import *
+from elegant_drl_model.running_state import ZFilter
+
+import scipy
+import sys 
+
 
 class AgentBase:
     def __init__(self):
@@ -110,6 +122,166 @@ class AgentBase:
         for tar, cur in zip(target_net.parameters(), current_net.parameters()):
             tar.data.copy_(cur.data.__mul__(tau) + tar.data.__mul__(1 - tau))
 
+
+class AgentTRPO(AgentBase):
+   def __init__(self):
+        super().__init__()
+        #State_dim = 301
+
+   def init(self, net_dim, state_dim, action_dim):
+        self.action_dim = action_dim
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.act = ActorTRPO(state_dim, action_dim).to(self.device) #Actor
+        self.crit =  CriticTRPO(state_dim).to(self.device)            #Critic  
+
+        self.tau = 0.97
+        self.l2_reg = 1e-3
+        self.max_kl = 1e-2
+        self.damping = 1e-1
+        self.gamma = 0.995
+        self.if_on_policy = True
+        #self.if_gpu = True
+        self.if_use_gae = False  # if use Generalized Advantage Estimation
+
+
+    #Note to self: noise wasnt in original paper
+   def select_action(self, state):
+        state = torch.from_numpy(state).unsqueeze(0).to(self.device)
+        action_mean, _, action_std = self.act(Variable(state))
+        action = torch.normal(action_mean, action_std)
+        noise = torch.randn_like(action)
+
+        return action[0].cpu().float().numpy(), noise[0].cpu().float().numpy()
+
+    #Might be wrong Q_Q
+   def explore_env(self, env, buffer, target_step, reward_scale, gamma) -> int:
+      buffer.empty_buffer_before_explore()  # NOTICE! necessary for on-policy
+        # assert target_step == buffer.max_len - max_step
+
+      actual_step = 0
+      while actual_step < target_step:
+          state = env.reset()
+          for _ in range(env.max_step):
+              action, noise = self.select_action(state)
+              next_state, reward, done, _ = env.step(np.tanh(action))
+              actual_step += 1
+
+              other = (reward * reward_scale, 0.0 if done else gamma, *action, *noise)
+              buffer.append_buffer(state, other)
+              if done:
+                  break
+              state = next_state
+      return actual_step
+
+        
+   #As of 5/6 11:50pm is takes ~40 seconds for 100 epochs
+   #Thus, with 4096 target * 8 repeating it takes ~4 hours
+   def update_net(self, buffer, target_step, batch_size, repeat_times) -> (float, float):
+        buffer.update_now_len_before_sample()
+        for i in range(int(target_step * repeat_times)):
+          act_loss, crit_loss = self.update_params(buffer.sample_batch(batch_size))
+        return act_loss.item(), crit_loss.item()
+
+   def update_params(self, batch):
+     #reward, mask, action, state, next_state
+        rewards = batch[0]
+        masks = batch[1]
+        actions = batch[2]
+        #Issue: Elegant RL somehow doubles output size if on policy
+        #Initializes an empty tensor with double the size but only the first half gets used
+
+        #Possible solution: Use only first half of actions 
+        #Another solution: Concatenate noises onto second half of actions
+
+        #actions = torch.Tensor(np.concatenate(batch[2].cpu().numpy(), 0))
+        states = batch[3]
+        values = self.crit(Variable(states))
+        noises = batch[4]
+
+        returns = torch.Tensor(actions.size(0),1).to(self.device)
+        deltas = torch.Tensor(actions.size(0),1).to(self.device)
+        advantages = torch.Tensor(actions.size(0),1).to(self.device)
+
+        prev_return = 0
+        prev_value = 0
+        prev_advantage = 0
+        for i in reversed(range(rewards.size(0))):
+            returns[i] = rewards[i] + self.gamma * prev_return * masks[i]
+            deltas[i] = rewards[i] + self.gamma * prev_value * masks[i] - values.data[i]
+            advantages[i] = deltas[i] + self.gamma * self.tau * prev_advantage * masks[i]
+
+            prev_return = returns[i, 0]
+            prev_value = values.data[i, 0]
+            prev_advantage = advantages[i, 0]
+        targets = Variable(returns)
+
+        # Original code uses the same LBFGS to optimize the value loss
+        def get_value_loss(flat_params):
+            set_flat_params_to(self.crit, torch.Tensor(flat_params))
+            for param in self.crit.parameters():
+                if param.grad is not None:
+                    param.grad.data.fill_(0)
+
+            values_ = self.crit(Variable(states))
+
+            #Values shape: [1023, 1]
+            #Targets shape: [61380, 1]
+            #Actions shape: [61380, 1]
+            #returns shape: [61380, 1]
+            #states shape: [1023, 301]
+
+            value_loss = (values_ - targets.reshape((values_.size(0), -1))).pow(2).mean()
+
+            # weight decay
+            for param in self.crit.parameters():
+                value_loss += param.pow(2).sum() * self.l2_reg
+            value_loss.backward()
+            return (value_loss.data.double().cpu().numpy(), get_flat_grad_from(self.crit).data.double().cpu().numpy())
+
+        flat_params, _, opt_info = scipy.optimize.fmin_l_bfgs_b(get_value_loss, get_flat_params_from(self.crit).double().cpu().numpy(), maxiter=25)
+        set_flat_params_to(self.crit, torch.Tensor(flat_params))
+
+        advantages = (advantages - advantages.mean()) / advantages.std()
+        advantages = advantages.reshape((states.size(0), -1))
+
+        action_means, action_log_stds, action_stds = self.act(Variable(states))
+        
+
+        actions = actions[:,action_means.size(1)]
+
+
+        #print('acmeans', action_means.shape)
+        #print('log std', action_log_stds.shape)
+        #print('std ', action_stds.shape)
+        #print('ac ', Variable(actions).shape)
+        fixed_log_prob = normal_log_density(Variable(actions).to(self.device), action_means, action_log_stds, action_stds).data.clone()
+
+        def get_loss(volatile=False):
+            if volatile:
+                with torch.no_grad():
+                    action_means, action_log_stds, action_stds = self.act(Variable(states))
+            else:
+                action_means, action_log_stds, action_stds = self.act(Variable(states))
+                    
+            log_prob = normal_log_density(Variable(actions).to(self.device), action_means, action_log_stds, action_stds)
+            action_loss = -Variable(advantages) * torch.exp(log_prob - Variable(fixed_log_prob))
+            return action_loss.mean()
+
+
+        def get_kl():
+            mean1, log_std1, std1 = self.act(Variable(states))
+
+            mean0 = Variable(mean1.data)
+            log_std0 = Variable(log_std1.data)
+            std0 = Variable(std1.data)
+            kl = log_std1 - log_std0 + (std0.pow(2) + (mean0 - mean1).pow(2)) / (2.0 * std1.pow(2)) - 0.5
+            return kl.sum(1, keepdim=True)
+
+        act_loss = trpo_step(self.act, get_loss, get_kl, self.max_kl, self.damping)
+        
+        #return act_loss, advantages
+        return act_loss, get_loss()
 
 class AgentDQN(AgentBase):
     def __init__(self):
@@ -900,8 +1072,8 @@ class ReplayBuffer:
         self.if_gpu = if_gpu
 
         if if_on_policy:
-            self.if_gpu = False
             other_dim = 1 + 1 + action_dim * 2
+            self.ig_gpu = True
         else:
             other_dim = 1 + 1 + action_dim
 
@@ -928,7 +1100,7 @@ class ReplayBuffer:
         if self.if_gpu:
             state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
             other = torch.as_tensor(other, dtype=torch.float32, device=self.device)
-
+        
         size = len(other)
         next_idx = self.next_idx + size
         if next_idx > self.max_len:
@@ -1061,6 +1233,13 @@ class ReplayBufferMP:
         rd_batch_sizes = (rd_batch_sizes * (batch_size / rd_batch_sizes.sum())).astype(np.int)
         l__r_m_a_s_ns = [self.buffers[i].sample_batch(rd_batch_sizes[i])
                          for i in range(self.rollout_num) if rd_batch_sizes[i] > 2]
+        #print(type(l__r_m_a_s_ns))
+        #print('Type of item 0', type(l__r_m_a_s_ns[0][0]))
+        #print('Type of item 1', type(l__r_m_a_s_ns[0][1]))
+        #print('Type of item 2', type(l__r_m_a_s_ns[0][2]))
+        #print('Type of item 3', type(l__r_m_a_s_ns[0][3]))
+        #print('Type of item 4', type(l__r_m_a_s_ns[0][4]))
+
         return (torch.cat([item[0] for item in l__r_m_a_s_ns], dim=0),
                 torch.cat([item[1] for item in l__r_m_a_s_ns], dim=0),
                 torch.cat([item[2] for item in l__r_m_a_s_ns], dim=0),
