@@ -9,14 +9,9 @@ Considering the stochastic and interactive nature of the automated stock trading
 ## File Structure
 
 - **DRL-for-Automated-Stock-Trading** # main folder
-  - train # a collection of training programs
-
-  	- config.py  # configurations (hyper-parameter)
-  	- **run.py**  # training loop
-  	- worker.py  # the worker class (explores the env, saving the data to replay buffer)
-  	- learner.py  # the learner class (update the networks, using the data in replay buffer)
-  	- evaluator.py  # the evaluator class (evaluate the cumulative returns of policy network)
-  	- replay_buffer.py # the buffer class (save sequences of transitions for training)
+  - train # the training process will terminate once it reaches the target reward
+  - test # backtest the model to evaluate performance of the trading strategy
+  
 - **elegant_drl_model** # collection of DRL algorithms
   - config.py  # configurations (hyper-parameter)
   - **agent.py**  # DRL algorithms
